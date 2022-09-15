@@ -9,11 +9,17 @@
 #include <cpu_func.h>
 #include <env.h>
 #include <malloc.h>
+#include <asm/dma-mapping.h>
+
 #include <memalign.h>
 #include <zynqmp_firmware.h>
 #include <asm/arch/hardware.h>
 #include <asm/arch/sys_proto.h>
 #include <asm/io.h>
+#include <config.h>
+#include <u-boot/crc.h>
+#include <net.h>
+
 
 struct aes {
 	u64 srcaddr;
@@ -361,6 +367,135 @@ static int do_zynqmp_sha3(struct cmd_tbl *cmdtp, int flag,
 
 	return CMD_RET_SUCCESS;
 }
+struct xilinx_efuse {
+	u64 src;
+	u32 size;
+	u32 offset;
+	u32 flag;
+	u32 pufuserfuse;
+};
+
+int zynqmp_pm_efuse_access(const u64 address, u32 *out)
+{
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	int ret;
+
+	if (!out)
+		return -EINVAL;
+
+	ret = xilinx_pm_request(PM_EFUSE_ACCESS, upper_32_bits(address),
+				  lower_32_bits(address), 0, 0, ret_payload);
+
+	int i;
+#ifdef DEBUG
+	for(i=0; i<PAYLOAD_ARG_CNT; i++) {
+		printf("ret_payload[%d] = %x \n", i, ret_payload[i]);
+	}
+#endif
+
+	*out = ret_payload[1];
+
+	return ret;
+}
+void print_eth_addr(const char *eth_addr, u8 id)
+{
+	int i;
+	printf("Generated MAC %d: ", id);
+	for(i=0; i<6; i++) {
+		printf("%2x", eth_addr[i]);
+
+		if(i == 5)
+			continue;
+
+		printf(":");
+	}
+	printf("\n");
+}
+
+#define EFUSE_NOT_ENABLED  (29)
+#define DNA_ADDR           (0xC)
+#define DNA_SIZE           (0xC)
+#define DNA_WORD_SIZE      (0x4)
+static int do_zynqmp_dna_read(struct cmd_tbl *cmdtp, int flag,
+			  int argc, char * const argv[])
+{
+	int i;
+				/* Fixed prefix */
+	u8 eth_addr[ARP_HLEN] = {0xca, 0xff, 0xee};
+	u8 eth_addr2[ARP_HLEN];
+	char device_dna[50] = {0};
+	dma_addr_t dma_addr, dma_buf;
+	struct xilinx_efuse *efuse;
+	char *data;
+	int ret;
+	u32 val[DNA_SIZE]; /* Buffer that can accomodate DNA */
+
+	efuse = dma_alloc_coherent(sizeof(struct xilinx_efuse), &dma_addr);
+	if (!efuse)
+		return -ENOMEM;
+
+	data = dma_alloc_coherent(DNA_SIZE, &dma_buf);
+	if (!data) {
+		dma_free_coherent(dma_addr);
+		return -ENOMEM;
+	}
+
+	efuse->flag = 0; /* READ flag */
+	efuse->src = dma_buf;
+	efuse->size = DNA_SIZE / DNA_WORD_SIZE;
+	efuse->offset = DNA_ADDR;
+	efuse->pufuserfuse = 0; /* Not a USER fuse */
+
+	flush_dcache_range(dma_addr, ARCH_DMA_MINALIGN);
+	flush_dcache_range(dma_buf, ARCH_DMA_MINALIGN);
+
+	zynqmp_pm_efuse_access(dma_addr, (u32 *)&ret);
+	if (ret != 0) {
+		if (ret == EFUSE_NOT_ENABLED) {
+			printf( "efuse access is not enabled\n");
+			ret = -EOPNOTSUPP;
+			goto END;
+		}
+		printf( "Error in efuse read! Errno=%x\n", ret);
+		ret = -EPERM;
+		goto END;
+	}
+
+	memcpy(val, data, DNA_SIZE);
+
+	strcpy(device_dna, simple_xtoa(val[2]));
+	strcat(device_dna, simple_xtoa(val[1]));
+	strcat(device_dna, simple_xtoa(val[0]));
+
+#ifdef DEBUG
+        for(i=2; i>=0; i--) {
+              printf("val[%d] = 0x%x \n", i, val[i]);
+        }
+#endif
+
+	printf("device_dna: %s\n", device_dna);
+
+	eth_addr[3] = crc8(0x0, val[2], sizeof(u32));
+	eth_addr[4] = crc8(0x0, val[1], sizeof(u32));
+	eth_addr[5] = crc8(0x0, val[0], sizeof(u32));
+
+	memcpy(eth_addr2, eth_addr, ARP_HLEN);
+	eth_addr2[5] = eth_addr2[5] + 1;
+
+	print_eth_addr(eth_addr, 1);
+	print_eth_addr(eth_addr2, 2);
+
+
+	eth_env_set_enetaddr("ethaddr", eth_addr);
+	eth_env_set_enetaddr("eth1addr", eth_addr2);
+	env_set("device_dna", device_dna);
+
+END:
+	dma_free_coherent(dma_buf);
+	dma_free_coherent(dma_addr);
+
+	return ret;
+}
 
 static struct cmd_tbl cmd_zynqmp_sub[] = {
 	U_BOOT_CMD_MKENT(secure, 5, 0, do_zynqmp_verify_secure, "", ""),
@@ -373,6 +508,7 @@ static struct cmd_tbl cmd_zynqmp_sub[] = {
 #ifdef CONFIG_DEFINE_TCM_OCM_MMAP
 	U_BOOT_CMD_MKENT(tcminit, 3, 0, do_zynqmp_tcm_init, "", ""),
 #endif
+	U_BOOT_CMD_MKENT(dna_mac, 2, 0, do_zynqmp_dna_read, "", ""),
 };
 
 /**
@@ -445,9 +581,9 @@ static char zynqmp_help_text[] =
 	"	48 bytes hash value into srcaddr\n"
 	"	Optional key_addr can be specified for saving sha3 hash value\n"
 	"	Note: srcaddr/srclen should not be 0\n"
+	"zynqmp dna_mac - generates MAC based on device DNA\n"
 	;
 #endif
-
 U_BOOT_CMD(
 	zynqmp, 9, 1, do_zynqmp,
 	"ZynqMP sub-system",
